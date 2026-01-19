@@ -9,11 +9,12 @@ use wgpu::{
     hal::{api, gles},
     include_wgsl, BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayoutDescriptor,
     BindGroupLayoutEntry, BindingResource, BindingType, Color, ColorTargetState, ColorWrites,
-    FragmentState, LoadOp, PipelineCompilationOptions, PipelineLayoutDescriptor, PrimitiveState,
-    PrimitiveTopology, PushConstantRange, RenderPassColorAttachment, RenderPassDescriptor,
-    RenderPipeline, RenderPipelineDescriptor, SamplerBindingType, SamplerDescriptor, ShaderStages,
-    StoreOp, TextureSampleType, TextureView, TextureViewDescriptor, TextureViewDimension,
-    VertexState,
+    Extent3d, FragmentState, LoadOp, PipelineCompilationOptions, PipelineLayoutDescriptor,
+    PrimitiveState, PrimitiveTopology, PushConstantRange, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, SamplerBindingType,
+    SamplerDescriptor, ShaderStages, StoreOp, Texture, TextureDescriptor, TextureDimension,
+    TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor,
+    TextureViewDimension, VertexState,
 };
 
 const TRANSFORM_CONST_SIZE: u32 = mem::size_of::<Mat4>() as u32;
@@ -27,6 +28,128 @@ const _: () = assert!(
 
 const TRANSFORM_CONST_OFFSET: u32 = 0;
 const VIEW_INDEX_CONST_OFFSET: u32 = TRANSFORM_CONST_SIZE;
+
+// LUT texture dimensions: 64x64x64 3D LUT stored as 512x512 2D texture (8x8 grid of 64x64 slices)
+const LUT_SIZE: u32 = 64;
+const LUT_GRID_SIZE: u32 = 8;
+const LUT_TEXTURE_SIZE: u32 = LUT_SIZE * LUT_GRID_SIZE; // 512x512
+
+// Embedded default LUT image - a 512x512 PNG with identity mapping and full alpha
+// If you want to use a custom LUT, replace this file at:
+// alvr/graphics/resources/passthrough_lut.png
+//
+// LUT Format Requirements:
+// - Size: 512x512 pixels (8x8 grid of 64x64 slices)
+// - Format: RGBA PNG (alpha channel is used for chroma keying)
+// - Structure: 3D LUT unwrapped as 2D texture
+//   - Blue channel (Z-axis) determines which slice (0-63)
+//   - Slices arranged in 8x8 grid (left-to-right, top-to-bottom)
+//   - Within each slice: Red = X-axis, Green = Y-axis
+// - Alpha channel: 0 = show PC stream (opaque), 255 = show passthrough (transparent)
+//
+// For chroma keying (e.g., green screen):
+// - Set alpha=255 for colors you want to make transparent (e.g., green colors)
+// - Set alpha=0 for colors you want to keep visible
+static DEFAULT_LUT_DATA: &[u8] = include_bytes!("../resources/passthrough_lut.png");
+
+/// Creates a default identity LUT texture with full opacity (no chroma keying)
+fn create_default_lut_data() -> Vec<u8> {
+    let mut data = Vec::with_capacity((LUT_TEXTURE_SIZE * LUT_TEXTURE_SIZE * 4) as usize);
+
+    for y in 0..LUT_TEXTURE_SIZE {
+        for x in 0..LUT_TEXTURE_SIZE {
+            // Determine which slice we're in
+            let slice_x = x / LUT_SIZE;
+            let slice_y = y / LUT_SIZE;
+            let blue = slice_y * LUT_GRID_SIZE + slice_x;
+
+            // Position within the slice
+            let local_x = x % LUT_SIZE;
+            let local_y = y % LUT_SIZE;
+
+            // Map to RGB values (identity LUT)
+            let red = (local_x * 255 / (LUT_SIZE - 1)) as u8;
+            let green = (local_y * 255 / (LUT_SIZE - 1)) as u8;
+            let blue = (blue * 255 / (LUT_SIZE - 1)) as u8;
+
+            // Alpha = 0 means fully opaque (show stream), no chroma keying by default
+            data.extend_from_slice(&[red, green, blue, 0]);
+        }
+    }
+
+    data
+}
+
+/// Loads LUT data from embedded PNG or falls back to generated identity LUT
+fn load_lut_data() -> Vec<u8> {
+    // Try to decode the embedded PNG
+    match image::load_from_memory(DEFAULT_LUT_DATA) {
+        Ok(img) => {
+            let rgba = img.to_rgba8();
+            if rgba.width() == LUT_TEXTURE_SIZE && rgba.height() == LUT_TEXTURE_SIZE {
+                rgba.into_raw()
+            } else {
+                alvr_common::warn!(
+                    "LUT texture has incorrect dimensions ({}x{}), expected {}x{}. Using default identity LUT.",
+                    rgba.width(),
+                    rgba.height(),
+                    LUT_TEXTURE_SIZE,
+                    LUT_TEXTURE_SIZE
+                );
+                create_default_lut_data()
+            }
+        }
+        Err(e) => {
+            alvr_common::warn!(
+                "Failed to load LUT texture: {}. Using default identity LUT.",
+                e
+            );
+            create_default_lut_data()
+        }
+    }
+}
+
+/// Creates a LUT texture from raw RGBA data
+fn create_lut_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> Texture {
+    let lut_data = load_lut_data();
+
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("LUT Texture"),
+        size: Extent3d {
+            width: LUT_TEXTURE_SIZE,
+            height: LUT_TEXTURE_SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &lut_data,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(LUT_TEXTURE_SIZE * 4),
+            rows_per_image: Some(LUT_TEXTURE_SIZE),
+        },
+        Extent3d {
+            width: LUT_TEXTURE_SIZE,
+            height: LUT_TEXTURE_SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    texture
+}
 
 pub struct StreamViewParams {
     pub swapchain_index: u32,
@@ -64,6 +187,13 @@ impl StreamRenderer {
 
         let target_format = super::gl_format_to_wgpu(target_format);
 
+        // Check if we should enable LUT chroma keying (only for Blend mode)
+        let enable_lut_chroma_key = matches!(passthrough, Some(PassthroughMode::Blend { .. }));
+
+        // Create LUT texture for chroma keying
+        let lut_texture = create_lut_texture(device, &context.queue);
+        let lut_texture_view = lut_texture.create_view(&TextureViewDescriptor::default());
+
         let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: None,
             entries: &[
@@ -83,6 +213,24 @@ impl StreamRenderer {
                     ty: BindingType::Sampler(SamplerBindingType::Filtering),
                     count: None,
                 },
+                // LUT texture binding
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // LUT sampler binding
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
             ],
         });
 
@@ -96,6 +244,8 @@ impl StreamRenderer {
                 enable_srgb_correction.into(),
             ),
             ("ENCODING_GAMMA".into(), encoding_gamma.into()),
+            // Enable LUT chroma keying only in Blend passthrough mode
+            ("ENABLE_LUT_CHROMA_KEY".into(), enable_lut_chroma_key.into()),
         ]);
 
         if let Some(mode) = passthrough {
@@ -164,6 +314,15 @@ impl StreamRenderer {
             ..Default::default()
         });
 
+        // Create a separate sampler for the LUT with clamp-to-edge addressing
+        let lut_sampler = device.create_sampler(&SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
         let mut view_objects = vec![];
         let mut staging_textures_gl = vec![];
         for target_swapchain in &swapchain_textures {
@@ -191,6 +350,16 @@ impl StreamRenderer {
                     BindGroupEntry {
                         binding: 1,
                         resource: BindingResource::Sampler(&sampler),
+                    },
+                    // LUT texture binding
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::TextureView(&lut_texture_view),
+                    },
+                    // LUT sampler binding
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: BindingResource::Sampler(&lut_sampler),
                     },
                 ],
             });
