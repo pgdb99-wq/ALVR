@@ -51,6 +51,7 @@ This is a fork of [ALVR](https://github.com/polygraphene/ALVR).
     -   It is recommended to use 802.11ac 5Ghz for the headset and ethernet for PC
     -   You need to connect both the PC and the headset to same router (or use a routed connection as described [here](https://github.com/alvr-org/ALVR/wiki/ALVR-v14-and-Above))
 
+-   Retroreflective material and the power of friendship.
 ## Install
 
 Follow the installation guide [here](https://github.com/alvr-org/ALVR/wiki/Installation-guide).
