@@ -56,21 +56,25 @@ static DEFAULT_LUT_DATA: &[u8] = include_bytes!("../resources/passthrough_lut.pn
 fn create_default_lut_data() -> Vec<u8> {
     let mut data = Vec::with_capacity((LUT_TEXTURE_SIZE * LUT_TEXTURE_SIZE * 4) as usize);
 
+    // Pre-calculate the division factor: 255 / 63 ≈ 4.047619
+    // We use fixed-point math: (value * 255 + 31) / 63 for proper rounding
+    const LUT_MAX: u32 = LUT_SIZE - 1; // 63
+
     for y in 0..LUT_TEXTURE_SIZE {
         for x in 0..LUT_TEXTURE_SIZE {
-            // Determine which slice we're in
-            let slice_x = x / LUT_SIZE;
-            let slice_y = y / LUT_SIZE;
-            let blue = slice_y * LUT_GRID_SIZE + slice_x;
+            // Determine which slice we're in (using shifts since LUT_SIZE is 64 = 2^6)
+            let slice_x = x >> 6; // x / 64
+            let slice_y = y >> 6; // y / 64
+            let blue_idx = slice_y * LUT_GRID_SIZE + slice_x;
 
-            // Position within the slice
-            let local_x = x % LUT_SIZE;
-            let local_y = y % LUT_SIZE;
+            // Position within the slice (using mask since LUT_SIZE is 64)
+            let local_x = x & 0x3F; // x % 64
+            let local_y = y & 0x3F; // y % 64
 
-            // Map to RGB values (identity LUT)
-            let red = (local_x * 255 / (LUT_SIZE - 1)) as u8;
-            let green = (local_y * 255 / (LUT_SIZE - 1)) as u8;
-            let blue = (blue * 255 / (LUT_SIZE - 1)) as u8;
+            // Map to RGB values (identity LUT) with proper rounding
+            let red = ((local_x * 255 + LUT_MAX / 2) / LUT_MAX) as u8;
+            let green = ((local_y * 255 + LUT_MAX / 2) / LUT_MAX) as u8;
+            let blue = ((blue_idx * 255 + LUT_MAX / 2) / LUT_MAX) as u8;
 
             // Alpha = 0 means fully opaque (show stream), no chroma keying by default
             data.extend_from_slice(&[red, green, blue, 0]);
@@ -151,6 +155,48 @@ fn create_lut_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> Texture {
     texture
 }
 
+/// Creates a minimal 1x1 dummy LUT texture when LUT chroma keying is disabled
+/// This avoids loading and decoding the full 512x512 PNG when not needed
+fn create_dummy_lut_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> Texture {
+    let texture = device.create_texture(&TextureDescriptor {
+        label: Some("Dummy LUT Texture"),
+        size: Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+
+    // Write a single black pixel with alpha=0 (no chroma keying)
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[0u8, 0, 0, 0], // RGBA: black, fully opaque (no keying)
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4),
+            rows_per_image: Some(1),
+        },
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+
+    texture
+}
+
 pub struct StreamViewParams {
     pub swapchain_index: u32,
     pub reprojection_rotation: Quat,
@@ -190,8 +236,13 @@ impl StreamRenderer {
         // Check if we should enable LUT chroma keying (only for Blend mode)
         let enable_lut_chroma_key = matches!(passthrough, Some(PassthroughMode::Blend { .. }));
 
-        // Create LUT texture for chroma keying
-        let lut_texture = create_lut_texture(device, &context.queue);
+        // Create LUT texture for chroma keying (only load full LUT when needed)
+        let lut_texture = if enable_lut_chroma_key {
+            create_lut_texture(device, &context.queue)
+        } else {
+            // Create a minimal 1x1 dummy texture when LUT is not needed
+            create_dummy_lut_texture(device, &context.queue)
+        };
         let lut_texture_view = lut_texture.create_view(&TextureViewDescriptor::default());
 
         let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
