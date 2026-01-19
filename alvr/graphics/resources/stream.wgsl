@@ -4,6 +4,12 @@ const DIV1: f32 = 0.94786729857; // 1.0 / 1.055
 const THRESHOLD: f32 = 0.04045;
 const GAMMA: vec3f = vec3f(2.4);
 
+// LUT constants - 64x64x64 3D LUT stored as 512x512 2D texture (8x8 grid of 64x64 slices)
+const LUT_SIZE: f32 = 64.0;
+const LUT_GRID_SIZE: f32 = 8.0;  // sqrt(64) = 8 slices per row/column
+const LUT_TEXEL_SIZE: f32 = 1.0 / 512.0;  // 1 / (64 * 8)
+const LUT_SLICE_SIZE: f32 = 64.0 / 512.0;  // Size of one slice in UV space
+
 override ENABLE_SRGB_CORRECTION: bool;
 override ENCODING_GAMMA: f32;
 
@@ -37,6 +43,9 @@ override C_RIGHT_Y: f32 = 0.;
 
 override COLOR_ALPHA: f32 = 1.0;
 
+// Enable LUT-based chroma keying for Blend passthrough mode
+override ENABLE_LUT_CHROMA_KEY: bool = false;
+
 struct PushConstant {
     reprojection_transform: mat4x4f,
     view_idx: u32,
@@ -45,6 +54,49 @@ var<push_constant> pc: PushConstant;
 
 @group(0) @binding(0) var stream_texture: texture_2d<f32>;
 @group(0) @binding(1) var stream_sampler: sampler;
+@group(0) @binding(2) var lut_texture: texture_2d<f32>;
+@group(0) @binding(3) var lut_sampler: sampler;
+
+// Sample 3D LUT stored as 2D texture
+// The LUT is a 64x64x64 cube stored as 8x8 grid of 64x64 slices
+// Blue channel determines which slice, Red/Green determine position within slice
+fn sample_lut(color: vec3f) -> vec4f {
+    // Clamp input to valid range
+    let c = clamp(color, vec3f(0.0), vec3f(1.0));
+    
+    // Scale to LUT coordinates (0 to 63)
+    let scaled = c * (LUT_SIZE - 1.0);
+    
+    // Get the two blue slices to interpolate between
+    let blue_low = floor(scaled.b);
+    let blue_high = min(blue_low + 1.0, LUT_SIZE - 1.0);
+    let blue_fract = scaled.b - blue_low;
+    
+    // Calculate slice positions in the 8x8 grid
+    let slice_low_x = blue_low % LUT_GRID_SIZE;
+    let slice_low_y = floor(blue_low / LUT_GRID_SIZE);
+    let slice_high_x = blue_high % LUT_GRID_SIZE;
+    let slice_high_y = floor(blue_high / LUT_GRID_SIZE);
+    
+    // Calculate UV coordinates within each slice (with half-texel offset for proper sampling)
+    let uv_within_slice = (scaled.rg + 0.5) / LUT_SIZE;
+    
+    // Calculate final UV coordinates for both slices
+    let uv_low = vec2f(
+        (slice_low_x + uv_within_slice.r) * LUT_SLICE_SIZE,
+        (slice_low_y + uv_within_slice.g) * LUT_SLICE_SIZE
+    );
+    let uv_high = vec2f(
+        (slice_high_x + uv_within_slice.r) * LUT_SLICE_SIZE,
+        (slice_high_y + uv_within_slice.g) * LUT_SLICE_SIZE
+    );
+    
+    // Sample both slices and interpolate
+    let sample_low = textureSample(lut_texture, lut_sampler, uv_low);
+    let sample_high = textureSample(lut_texture, lut_sampler, uv_high);
+    
+    return mix(sample_low, sample_high, blue_fract);
+}
 
 struct VertexOutput {
     @builtin(position) position: vec4f,
@@ -127,5 +179,15 @@ fn fragment_main(@location(0) uv: vec2f) -> @location(0) vec4f {
         color = enc_condition * enc_lowValues + (1.0 - enc_condition) * enc_highValues;
     }
 
-    return vec4f(color, COLOR_ALPHA);
+    // Apply LUT-based chroma keying when in Blend passthrough mode
+    // The LUT alpha channel controls visibility: 0 = show PC stream, 1 = show passthrough
+    var final_alpha = COLOR_ALPHA;
+    if ENABLE_LUT_CHROMA_KEY {
+        let lut_result = sample_lut(color);
+        // LUT alpha: 0 = fully opaque (show stream), 1 = fully transparent (show passthrough)
+        // Invert the alpha so that matching colors (high LUT alpha) become transparent
+        final_alpha = 1.0 - lut_result.a;
+    }
+
+    return vec4f(color, final_alpha);
 }
