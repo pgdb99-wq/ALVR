@@ -85,7 +85,7 @@ impl Lobby {
         self.renderer.update_hud_message(message);
     }
 
-    pub fn render(&mut self, vsync_time: Duration) -> ProjectionLayerBuilder {
+    pub fn render(&mut self, vsync_time: Duration) -> ProjectionLayerBuilder<'_> {
         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
 
         let (flags, maybe_views) = self

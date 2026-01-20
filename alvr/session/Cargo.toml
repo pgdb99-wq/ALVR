@@ -6,6 +6,9 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lints.rust]
+dead_code = "allow"
+
 [dependencies]
 alvr_common.workspace = true
 alvr_system_info.workspace = true

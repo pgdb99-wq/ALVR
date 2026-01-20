@@ -315,7 +315,7 @@ impl StreamContext {
         &mut self,
         frame_interval: Duration,
         vsync_time: Duration,
-    ) -> (ProjectionLayerBuilder, Duration) {
+    ) -> (ProjectionLayerBuilder<'_>, Duration) {
         let frame_poll_deadline = Instant::now()
             + Duration::from_secs_f32(
                 frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
