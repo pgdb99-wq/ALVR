@@ -509,7 +509,6 @@ pub struct FoveatedEncodingConfig {
 
 #[repr(C)]
 #[derive(SettingsSchema, Clone, Copy, Serialize, Deserialize, Pod, Zeroable)]
-#[allow(dead_code)]
 pub struct ColorCorrectionConfig {
     #[schema(gui(slider(min = -1.0, max = 1.0, step = 0.001)))]
     #[schema(flag = "steamvr-restart")]
